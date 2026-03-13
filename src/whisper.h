@@ -15,6 +15,8 @@ struct whisper_vocab;
 struct whisper_state;
 struct whisper_hparams;
 struct whisper_filters;
+struct whisper_layer_encoder;
+struct whisper_layer_decoder;
 
 enum e_model
 {
@@ -561,12 +563,137 @@ struct whisper_filters
     std::vector<float> data;
 };
 
+struct whisper_layer_encoder
+{
+    // encoder.blocks.*.attn_ln
+    struct ggml_tensor* attn_ln_0_w;
+    struct ggml_tensor* attn_ln_0_b;
+
+    // encoder.blocks.*.attn.out
+    struct ggml_tensor* attn_ln_1_w;
+    struct ggml_tensor* attn_ln_1_b;
+
+    // encoder.blocks.*.attn.query
+    struct ggml_tensor* attn_q_w;
+    struct ggml_tensor* attn_q_b;
+
+    // encoder.blocks.*.attn.key
+    struct ggml_tensor* attn_k_w;
+
+    // encoder.blocks.*.attn.value
+    struct ggml_tensor* attn_v_w;
+    struct ggml_tensor* attn_v_b;
+
+    // encoder.blocks.*.mlp_ln
+    struct ggml_tensor* mlp_ln_w;
+    struct ggml_tensor* mlp_ln_b;
+
+    // encoder.blocks.*.mlp.0
+    struct ggml_tensor* mlp_0_w;
+    struct ggml_tensor* mlp_0_b;
+
+    // encoder.blocks.*.mlp.2
+    struct ggml_tensor* mlp_1_w;
+    struct ggml_tensor* mlp_1_b;
+};
+
+struct whisper_layer_decoder
+{
+    // decoder.blocks.*.attn_ln
+    struct ggml_tensor *attn_ln_0_w;
+    struct ggml_tensor *attn_ln_0_b;
+
+    // decoder.blocks.*.attn.out
+    struct ggml_tensor *attn_ln_1_w;
+    struct ggml_tensor *attn_ln_1_b;
+
+    // decoder.blocks.*.attn.query
+    struct ggml_tensor *attn_q_w;
+    struct ggml_tensor *attn_q_b;
+
+    // decoder.blocks.*.attn.key
+    struct ggml_tensor *attn_k_w;
+
+    // decoder.blocks.*.attn.value
+    struct ggml_tensor *attn_v_w;
+    struct ggml_tensor *attn_v_b;
+
+    // decoder.blocks.*.cross_attn_ln
+    struct ggml_tensor *cross_attn_ln_0_w;
+    struct ggml_tensor *cross_attn_ln_0_b;
+
+    // decoder.blocks.*.cross_attn.out
+    struct ggml_tensor *cross_attn_ln_1_w;
+    struct ggml_tensor *cross_attn_ln_1_b;
+
+    // decoder.blocks.*.cross_attn.query
+    struct ggml_tensor *cross_attn_q_w;
+    struct ggml_tensor *cross_attn_q_b;
+
+    // decoder.blocks.*.cross_attn.key
+    struct ggml_tensor *cross_attn_k_w;
+
+    // decoder.blocks.*.cross_attn.value
+    struct ggml_tensor *cross_attn_v_w;
+    struct ggml_tensor *cross_attn_v_b;
+
+    // decoder.blocks.*.mlp_ln
+    struct ggml_tensor *mlp_ln_w;
+    struct ggml_tensor *mlp_ln_b;
+
+    // decoder.blocks.*.mlp.0
+    struct ggml_tensor *mlp_0_w;
+    struct ggml_tensor *mlp_0_b;
+
+    // decoder.blocks.*.mlp.2
+    struct ggml_tensor *mlp_1_w;
+    struct ggml_tensor *mlp_1_b;
+};
+
 struct whisper_model
 {
     e_model type = MODEL_UNKNOWN;
 
     whisper_hparams hparams;
     whisper_filters filters;
+    
+    // encoder.positional_embedding
+    struct ggml_tensor* e_pe;
+
+    // encoder.conv1
+    struct ggml_tensor *e_conv_1_w;
+    struct ggml_tensor *e_conv_1_b;
+
+    // encoder.conv2
+    struct ggml_tensor *e_conv_2_w;
+    struct ggml_tensor *e_conv_2_b;
+
+    // encoder.ln_post
+    struct ggml_tensor *e_ln_w;
+    struct ggml_tensor *e_ln_b;
+
+    // decoder.positional_embedding
+    struct ggml_tensor *d_pe;
+
+    // decoder.token_embedding
+    struct ggml_tensor *d_te;
+
+    // decoder.ln
+    struct ggml_tensor *d_ln_w;
+    struct ggml_tensor *d_ln_b;
+
+    std::vector<whisper_layer_encoder> layers_encoder;
+    std::vector<whisper_layer_decoder> layers_decoder;
+
+    // ggml context that contains all the meta information
+    std::vector<ggml_context*> ctxs;
+    
+    // the model backend data is read-only and can be shared between processors
+    std::vector<ggml_backend_buffer_t> buffers;
+
+    // tensors
+    int n_loaded;
+    std::map<std::string, struct ggml_tensor*> tensors;
 };
 
 struct whisper_vocab
