@@ -781,3 +781,47 @@ struct whisper_context* whisper_init_from_file_with_params(const char* path_mode
         return nullptr;
     return ctx;
 }
+
+/**
+void whisper_free_state(struct whisper_state *state)
+{
+    if (state)
+    {
+        whisper_kv_cache_free(state->kv_self);
+        whisper_kv_cache_free(state->kv_cross);
+        whisper_kv_cache_free(state->kv_pad);
+        whisper_batch_free(state->batch);
+
+        ggml_backend_sched_free(state->sched_conv.sched);
+        ggml_backend_sched_free(state->sched_encode.sched);
+        ggml_backend_sched_free(state->sched_cross.sched);
+        ggml_backend_sched_free(state->sched_decode.sched);
+
+        for (auto &backend : state->backends)
+        {
+            ggml_backend_free(backend);
+        }
+
+        delete state;
+    }
+}
+**/
+
+void whisper_free(struct whisper_context* ctx)
+{
+    if (ctx)
+    {
+        for (ggml_context* context : ctx->model.ctxs)
+        {
+            ggml_free(context);
+        }
+
+        for (ggml_backend_buffer_t buf : ctx->model.buffers)
+        {
+            ggml_backend_buffer_free(buf);
+        }
+
+        // whisper_free_state(ctx->state);
+        delete ctx;
+    }
+}

@@ -8,6 +8,11 @@
 #include <vector>
 #include <map>
 
+#define WHISPER_SAMPLE_RATE 16000
+#define WHISPER_N_FFT       400
+#define WHISPER_HOP_LENGTH  160
+#define WHISPER_CHUNK_SIZE  30
+
 struct whisper_model_loader;
 struct whisper_context;
 struct whisper_model;
@@ -745,5 +750,12 @@ struct whisper_context
 };
 
 struct whisper_context* whisper_init_from_file_with_params(const char* path_model);
+
+// Frees all allocated memory
+void whisper_free(struct whisper_context* ctx);
+
+// void whisper_free_state(struct whisper_state * state);
+// void whisper_free_params(struct whisper_full_params * params);
+// void whisper_free_context_params(struct whisper_context_params * params);
 
 #endif

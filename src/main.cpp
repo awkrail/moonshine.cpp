@@ -1,3 +1,4 @@
+#include "common-whisper.h"
 #include "whisper.h"
 
 #include <cstdio>
@@ -38,6 +39,18 @@ int main(int argc, char* argv[])
         fprintf(stderr, "error: failed to initialize whisper context\n");
         return 1;
     }
+
+    // load audio data
+    std::vector<float> pcmf32;
+    if (!read_audio_data(params.fname_inp, pcmf32))
+    {
+        fprintf(stderr, "error: failed to read '%s'\n", params.fname_inp.c_str());
+        whisper_free(ctx);
+        return 1;
+    }
+
+    // inference params
+    // whisper_full_params wparams = whisper_full_params();
 
 
 
