@@ -618,11 +618,99 @@ static bool whisper_model_load(struct whisper_model_loader* loader, whisper_cont
     // load weights
     {
         size_t total_size = 0;
+        model.n_loaded = 0;
 
+        std::vector<char> read_buf;
 
+        while (true)
+        {
+            int32_t n_dims;
+            int32_t length;
+            int32_t ttype;
 
+            read_safe(loader, n_dims);
+            read_safe(loader, length);
+            read_safe(loader, ttype);
+        
+            if (loader->eof(loader->context))
+                break;
 
+            int32_t nelements = 1;
+            int32_t ne[4] = { 1, 1, 1, 1 };
+            for (int i = 0; i < n_dims; i++)
+            {
+                read_safe(loader, ne[i]);
+                nelements *= ne[i];
+            }
+
+            std::string name;
+            std::vector<char> tmp(length);
+            loader->read(loader->context, &tmp[0], tmp.size());
+            name.assign(&tmp[0], tmp.size());
+
+            if (model.tensors.find(name) == model.tensors.end())
+            {
+                fprintf(stderr, "%s: unknown tensor '%s' in model file\n", __func__, name.data());
+                return false;
+            }
+
+            auto tensor = model.tensors[name.data()];
+            if (ggml_nelements(tensor) != nelements)
+            {
+                fprintf(stderr, "%s: tensor '%s' has wrong size in model file\n", __func__, name.data());
+                fprintf(stderr, "%s: shape: [%d, %d, %d], expected: [%d, %d, %d]\n", __func__, ne[0], ne[1], ne[2], (int)tensor->ne[0], (int)tensor->ne[1], (int)tensor->ne[2]);
+                return false;
+            }
+
+            if (tensor->ne[0] != ne[0] || tensor->ne[1] != ne[1] || tensor->ne[2] != ne[2])
+            {
+                fprintf(stderr, "%s: tensor '%s' has wrong shape in model file: got [%d, %d, %d], expected [%d, %d, %d]\n",
+                    __func__, name.data(), (int)tensor->ne[0], (int)tensor->ne[1], (int)tensor->ne[2], ne[0], ne[1], ne[2]);
+                return false;
+            }
+
+            const size_t bpe = ggml_type_size(ggml_type(ttype));
+
+            if ((nelements * bpe) / ggml_blck_size(tensor->type) != ggml_nbytes(tensor))
+            {
+                fprintf(stderr, "%s: tensor '%s' has wrong size in model file: got %zu, expected %zu\n",
+                    __func__, name.data(), ggml_nbytes(tensor), nelements * bpe);
+                return false;
+            }
+            
+            if (ggml_backend_buffer_is_host(tensor->buffer))
+            {
+                loader->read(loader->context, tensor->data, ggml_nbytes(tensor));
+            } else
+            {
+                read_buf.resize(ggml_nbytes(tensor));
+                loader->read(loader->context, read_buf.data(), read_buf.size());
+                ggml_backend_tensor_set(tensor, read_buf.data(), 0, ggml_nbytes(tensor));
+            }
+
+            total_size += ggml_nbytes(tensor);
+            model.n_loaded++;
+        }
+    
+        fprintf(stdout, "%s: model size    = %7.2f MB\n", __func__, total_size / 1e6);
+
+        if (model.n_loaded == 0)
+        {
+            fprintf(stdout, "%s: WARN no tensors loaded from model file - assuming empty model for testing\n", __func__);
+        }
+        else if (model.n_loaded != (int)model.tensors.size())
+        {
+            fprintf(stderr, "%s: ERROR not all tensors loaded from model file - expected %zu, got %d\n", __func__, model.tensors.size(), model.n_loaded);
+            return false;
+        }
     }
+    
+    for (auto &buf : model.buffers)
+    {
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
+
+    wctx.t_load_us = ggml_time_us() - t_start_us;
 
     return true;
 }
