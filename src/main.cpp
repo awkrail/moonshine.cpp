@@ -50,9 +50,14 @@ int main(int argc, char* argv[])
     }
 
     // inference params
-    // whisper_full_params wparams = whisper_full_params();
+    whisper_full_params wparams = whisper_full_default_params();
 
+    if (whisper_full(ctx, wparams, pcmf32.data(), (int)pcmf32.size()) != 0)
+    {
+        fprintf(stderr, "error: failed to process '%s'\n", params.fname_inp.c_str());
+        whisper_free(ctx);
+        return 1;
+    }
 
-
-
+    return 0;
 }

@@ -7,11 +7,14 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <random>
+#include <set>
 
 #define WHISPER_SAMPLE_RATE 16000
 #define WHISPER_N_FFT       400
 #define WHISPER_HOP_LENGTH  160
 #define WHISPER_CHUNK_SIZE  30
+#define WHISPER_MAX_DECODERS 8
 
 struct whisper_model_loader;
 struct whisper_context;
@@ -22,6 +25,26 @@ struct whisper_hparams;
 struct whisper_filters;
 struct whisper_layer_encoder;
 struct whisper_layer_decoder;
+struct whisper_full_params;
+struct whisper_kv_cell;
+struct whisper_kv_cache;
+struct whisper_mel;
+struct whisper_sequence;
+struct whisper_token_data;
+
+typedef int32_t whisper_pos;
+typedef int32_t whisper_token;
+typedef int32_t whisper_seq_id;
+
+template <typename A, typename B>
+struct whisper_pair
+{
+    A first;
+    B second;
+
+    whisper_pair(const A& a, const B& b) : first(a), second(b) {}
+    whisper_pair() : first(A()), second(B()) {}
+};
 
 enum e_model
 {
@@ -561,6 +584,42 @@ struct whisper_hparams
     float eps = 1e-5f;
 };
 
+struct whisper_token_data
+{
+    whisper_token id;
+    whisper_token tid;
+
+    float p;
+    float plog;
+    float pt;
+    float ptsum;
+
+    int64_t t0;
+    int64_t t1;
+
+    float vlen;
+};
+
+struct whisper_mel
+{
+    int n_len;
+    int n_len_org;
+    int n_mel;
+
+    std::vector<float> data;
+};
+
+struct whisper_batch
+{
+    int32_t n_tokens;
+
+    whisper_token* token;
+    whisper_pos* pos;
+    int32_t* n_seq_id;
+    whisper_seq_id** seq_id;
+    int8_t* logits;
+};
+
 struct whisper_filters
 {
     int32_t n_mel;
@@ -734,6 +793,128 @@ struct whisper_model_loader
     void  (*close)(void* ctx);
 };
 
+struct whisper_kv_cell
+{
+    whisper_pos pos = -1;
+    
+    std::set<whisper_seq_id> seq_id;
+
+    bool has_seq_id(const whisper_seq_id& id) const {
+        return seq_id.find(id) != seq_id.end();
+    }
+};
+
+struct whisper_kv_cache
+{
+    uint32_t head = 0;
+    uint32_t size = 0;
+
+    uint32_t n = 0;
+    
+    std::vector<whisper_kv_cell> cells;
+
+    struct ggml_tensor* k;
+    struct ggml_tensor* v;
+
+    ggml_backend_buffer_t buffer = nullptr;
+
+    std::vector<uint8_t> ctx_buf;
+};
+
+struct whisper_sequence
+{
+    std::vector<whisper_token_data> tokens;
+
+    int result_len;
+
+    double sum_logprobs_all;
+    double sum_logprobs;
+    double avg_logprobs;
+    double entropy;
+    double score;
+};
+
+struct whisper_decoder
+{
+    whisper_sequence sequence;
+
+    int i_batch;
+    int seek_delta;
+
+    bool failed;
+    bool completed;
+    bool has_ts;
+
+    std::vector<float> probs;
+    std::vector<float> logits;
+    std::vector<float> logprobs;
+
+    std::vector<whisper_pair<double, whisper_vocab::id>> logits_id;
+    mutable std::mt19937 rng;
+};
+
+struct whisper_state
+{
+    int64_t t_sample_us = 0;
+    int64_t t_encode_us = 0;
+    int64_t t_decode_us = 0;
+    int64_t t_batchd_us = 0;
+    int64_t t_prompt_us = 0;
+    int64_t t_mel_us = 0;
+
+    int32_t n_sample = 0; // number of tokens sampled
+    int32_t n_encode = 0; // number of encoder calls
+    int32_t n_decode =
+        0; // number of decoder calls with n_tokens == 1  (text-generation)
+    int32_t n_batchd =
+        0; // number of decoder calls with n_tokens <  16 (batch decoding)
+    int32_t n_prompt =
+        0; // number of decoder calls with n_tokens >  1  (prompt encoding)
+    int32_t n_fail_p = 0; // number of logprob threshold failures
+    int32_t n_fail_h = 0; // number of entropy threshold failures
+
+    // number of decoders for which we have constructed the KV cache
+    int32_t kv_self_n_dec = 0;
+
+    // unified self-attention KV cache for all decoders
+    whisper_kv_cache kv_self;
+
+    // cross-attention KV cache for the decoders
+    // shared between all decoders
+    whisper_kv_cache kv_cross;
+
+    // padded buffer for flash-attention
+    whisper_kv_cache kv_pad;
+
+    whisper_mel mel;
+
+    whisper_batch batch;
+
+    whisper_decoder decoders[WHISPER_MAX_DECODERS];
+
+    std::vector<ggml_backend_t> backends;
+
+    // - stores meta info about the intermediate tensors into the `meta` buffers
+    /**
+    whisper_sched sched_conv;
+    whisper_sched sched_encode;
+    whisper_sched sched_cross;
+    whisper_sched sched_decode;
+    **/
+
+    struct ggml_tensor* embd_conv = nullptr;
+    struct ggml_tensor* embd_enc = nullptr;
+
+    // helpers for GPU offloading
+    std::vector<float> inp_mel;
+    std::vector<float> inp_mask;
+
+    // decode output (2-dimensional array: [n_tokens][n_vocab])
+    std::vector<float> logits;
+
+    // std::vector<whisper_segment> result_all;
+};
+
 struct whisper_context
 {
     int64_t t_load_us = 0;
@@ -749,7 +930,116 @@ struct whisper_context
     std::string path_model;
 };
 
+struct whisper_full_params
+{
+    int n_threads;
+    int n_max_text_ctx;     // max tokens to use from past text as prompt for the decoder
+    int offset_ms;          // start offset in ms
+    int duration_ms;        // audio duration to process in ms
+
+    bool translate;
+    bool no_context;        // do not use past transcription (if any) as initial prompt for the decoder
+    bool no_timestamps;     // do not generate timestamps
+    bool single_segment;    // force single segment output (useful for streaming)
+    bool print_special;     // print special tokens (e.g. <SOT>, <EOT>, <BEG>, etc.)
+    bool print_progress;    // print progress information
+    bool print_realtime;    // print results from within whisper.cpp (avoid it, use callback instead)
+    bool print_timestamps;  // print timestamps for each text segment when printing realtime
+
+    // [EXPERIMENTAL] token-level timestamps
+    bool  token_timestamps; // enable token-level timestamps
+    float thold_pt;         // timestamp token probability threshold (~0.01)
+    float thold_ptsum;      // timestamp token sum probability threshold (~0.01)
+    int   max_len;          // max segment length in characters
+    bool  split_on_word;    // split on word rather than on token (when used with max_len)
+    int   max_tokens;       // max tokens per segment (0 = no limit)
+
+    // [EXPERIMENTAL] speed-up techniques
+    // note: these can significantly reduce the quality of the output
+    bool debug_mode;        // enable debug_mode provides extra info (eg. Dump log_mel)
+    int  audio_ctx;         // overwrite the audio context size (0 = use default)
+
+    // [EXPERIMENTAL] [TDRZ] tinydiarize
+    bool tdrz_enable;       // enable tinydiarize speaker turn detection
+
+    // A regular expression that matches tokens to suppress
+    const char * suppress_regex;
+
+    // tokens to provide to the whisper decoder as initial prompt
+    // these are prepended to any existing text context from a previous call
+    // use whisper_tokenize() to convert text to tokens
+    // maximum of whisper_n_text_ctx()/2 tokens are used (typically 224)
+    const char * initial_prompt;
+    bool carry_initial_prompt; // if true, always prepend initial_prompt to every decode window (may reduce conditioning on previous text)
+    const whisper_token * prompt_tokens;
+    int prompt_n_tokens;
+
+    // for auto-detection, set to nullptr, "" or "auto"
+    const char * language;
+    bool detect_language;
+
+    // common decoding parameters:
+    bool suppress_blank; // ref: https://github.com/openai/whisper/blob/f82bc59f5ea234d4b97fb2860842ed38519f7e65/whisper/decoding.py#L89
+    bool suppress_nst;   // non-speech tokens, ref: https://github.com/openai/whisper/blob/7858aa9c08d98f75575035ecd6481f462d66ca27/whisper/tokenizer.py#L224-L253
+
+    float temperature;      // initial decoding temperature, ref: https://ai.stackexchange.com/a/32478
+    float max_initial_ts;   // ref: https://github.com/openai/whisper/blob/f82bc59f5ea234d4b97fb2860842ed38519f7e65/whisper/decoding.py#L97
+    float length_penalty;   // ref: https://github.com/openai/whisper/blob/f82bc59f5ea234d4b97fb2860842ed38519f7e65/whisper/transcribe.py#L267
+
+    // fallback parameters
+    // ref: https://github.com/openai/whisper/blob/f82bc59f5ea234d4b97fb2860842ed38519f7e65/whisper/transcribe.py#L274-L278
+    float temperature_inc;
+    float entropy_thold;    // similar to OpenAI's "compression_ratio_threshold"
+    float logprob_thold;
+    float no_speech_thold;
+
+    struct {
+        int best_of;    // ref: https://github.com/openai/whisper/blob/f82bc59f5ea234d4b97fb2860842ed38519f7e65/whisper/transcribe.py#L264
+    } greedy;
+
+    struct {
+        int beam_size;  // ref: https://github.com/openai/whisper/blob/f82bc59f5ea234d4b97fb2860842ed38519f7e65/whisper/transcribe.py#L265
+
+        float patience; // TODO: not implemented, ref: https://arxiv.org/pdf/2204.05424.pdf
+    } beam_search;
+
+    // called for every newly generated text segment
+    /**
+    whisper_new_segment_callback new_segment_callback;
+    void * new_segment_callback_user_data;
+
+    // called on each progress update
+    whisper_progress_callback progress_callback;
+    void * progress_callback_user_data;
+
+    // called each time before the encoder starts
+    whisper_encoder_begin_callback encoder_begin_callback;
+    void * encoder_begin_callback_user_data;
+
+    // called each time before ggml computation starts
+    ggml_abort_callback abort_callback;
+    void * abort_callback_user_data;
+
+    // called by each decoder to filter obtained logits
+    whisper_logits_filter_callback logits_filter_callback;
+    void * logits_filter_callback_user_data;
+
+    const whisper_grammar_element ** grammar_rules;
+    size_t                           n_grammar_rules;
+    size_t                           i_start_rule;
+    float                            grammar_penalty;
+
+    // Voice Activity Detection (VAD) params
+    bool         vad;                         // Enable VAD
+    const char * vad_model_path;              // Path to VAD model
+    **/
+};
+
+struct whisper_full_params whisper_full_default_params();
+
 struct whisper_context* whisper_init_from_file_with_params(const char* path_model);
+
+int whisper_full(struct whisper_context* ctx, struct whisper_full_params params, const float* samples, int n_samples);
 
 // Frees all allocated memory
 void whisper_free(struct whisper_context* ctx);

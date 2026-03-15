@@ -9,6 +9,7 @@
 #include <fstream>
 #include <climits>
 #include <cstdarg>
+#include <thread>
 
 static std::string format(const char *fmt, ...) {
     va_list ap;
@@ -715,6 +716,35 @@ static bool whisper_model_load(struct whisper_model_loader* loader, whisper_cont
     return true;
 }
 
+static std::vector<ggml_backend_t> whisper_backend_init()
+{
+    std::vector<ggml_backend_t> result;
+
+    // ACCEL backends
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+            fprintf(stderr, "%s: using %s backend\n", __func__,
+                             ggml_backend_dev_name(dev));
+            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+            if (!backend) {
+                fprintf(stderr, "%s: failed to initialize %s backend\n",
+                                  __func__, ggml_backend_dev_name(dev));
+                continue;
+            }
+            result.push_back(backend);
+        }
+    }
+
+    ggml_backend_t backend_cpu =
+        ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (backend_cpu == nullptr) {
+        throw std::runtime_error("failed to initialize CPU backend");
+    }
+    result.push_back(backend_cpu);
+    return result;
+}
+
 struct whisper_context* whisper_init_with_params_no_state(struct whisper_model_loader* loader)
 {
     ggml_time_init();
@@ -774,38 +804,138 @@ struct whisper_context* whisper_init_from_file_with_params_no_state(const char* 
     return ctx;
 }
 
+struct whisper_state* whisper_init_state(whisper_context* ctx)
+{
+    whisper_state* state = new whisper_state;
+    state->backends = whisper_backend_init();
+    if (state->backends.empty())
+    {
+        fprintf(stderr, "%s: whisper_backend_init() failed\n", __func__);
+        // whisper_free_state(state);
+        return nullptr;
+    }
+
+    return state;
+}
+
 struct whisper_context* whisper_init_from_file_with_params(const char* path_model)
 {
     whisper_context* ctx = whisper_init_from_file_with_params_no_state(path_model);
     if (!ctx)
         return nullptr;
+    
+    ctx->state = whisper_init_state(ctx);
+    if (!ctx)
+    {
+        whisper_free(ctx);
+        return nullptr;
+    }
+
     return ctx;
 }
 
-/**
-void whisper_free_state(struct whisper_state *state)
+struct whisper_full_params whisper_full_default_params()
 {
-    if (state)
-    {
-        whisper_kv_cache_free(state->kv_self);
-        whisper_kv_cache_free(state->kv_cross);
-        whisper_kv_cache_free(state->kv_pad);
-        whisper_batch_free(state->batch);
+    struct whisper_full_params result = {
+        /*.n_threads         =*/
+        std::min(4, (int32_t)std::thread::hardware_concurrency()),
+        /*.n_max_text_ctx    =*/16384,
+        /*.offset_ms         =*/0,
+        /*.duration_ms       =*/0,
 
-        ggml_backend_sched_free(state->sched_conv.sched);
-        ggml_backend_sched_free(state->sched_encode.sched);
-        ggml_backend_sched_free(state->sched_cross.sched);
-        ggml_backend_sched_free(state->sched_decode.sched);
+        /*.translate         =*/false,
+        /*.no_context        =*/true,
+        /*.no_timestamps     =*/false,
+        /*.single_segment    =*/false,
+        /*.print_special     =*/false,
+        /*.print_progress    =*/false,
+        /*.print_realtime    =*/false,
+        /*.print_timestamps  =*/true,
 
-        for (auto &backend : state->backends)
+        /*.token_timestamps  =*/false,
+        /*.thold_pt          =*/0.01f,
+        /*.thold_ptsum       =*/0.01f,
+        /*.max_len           =*/0,
+        /*.split_on_word     =*/false,
+        /*.max_tokens        =*/0,
+
+        /*.debug_mode        =*/false,
+        /*.audio_ctx         =*/0,
+
+        /*.tdrz_enable       =*/false,
+
+        /* suppress_regex    =*/nullptr,
+
+        /*.initial_prompt       =*/nullptr,
+        /*.carry_initial_prompt =*/false,
+        /*.prompt_tokens        =*/nullptr,
+        /*.prompt_n_tokens      =*/0,
+
+        /*.language          =*/"en",
+        /*.detect_language   =*/false,
+
+        /*.suppress_blank    =*/true,
+        /*.suppress_nst      =*/false,
+
+        /*.temperature       =*/0.0f,
+        /*.max_initial_ts    =*/1.0f,
+        /*.length_penalty    =*/-1.0f,
+
+        /*.temperature_inc   =*/0.2f,
+        /*.entropy_thold     =*/2.4f,
+        /*.logprob_thold     =*/-1.0f,
+        /*.no_speech_thold   =*/0.6f,
+
+        /*.greedy            =*/
         {
-            ggml_backend_free(backend);
-        }
+            /*.best_of   =*/-1,
+        },
 
-        delete state;
-    }
+        /*.beam_search      =*/
+        {
+            /*.beam_size =*/-1,
+
+            /*.patience  =*/-1.0f,
+        },
+
+        ///*.new_segment_callback           =*/nullptr,
+        ///*.new_segment_callback_user_data =*/nullptr,
+
+        ///*.progress_callback           =*/nullptr,
+        ///*.progress_callback_user_data =*/nullptr,
+
+        ///*.encoder_begin_callback           =*/nullptr,
+        ///*.encoder_begin_callback_user_data =*/nullptr,
+
+        ///*.abort_callback                   =*/nullptr,
+        ///*.abort_callback_user_data         =*/nullptr,
+
+        ///*.logits_filter_callback           =*/nullptr,
+        ///*.logits_filter_callback_user_data =*/nullptr,
+
+        ///*.grammar_rules   =*/nullptr,
+        ///*.n_grammar_rules =*/0,
+        ///*.i_start_rule    =*/0,
+        ///*.grammar_penalty =*/100.0f,
+
+        ///*.vad                         =*/false,
+        ///*.vad_model_path              =*/nullptr,
+
+        ///* vad_params =*/whisper_vad_default_params(),
+    };
+    result.greedy = { 5 };
+    return result;
 }
-**/
+
+int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* state, struct whisper_full_params params, const float* samples, int n_samples)
+{
+    return 0;
+}
+
+int whisper_full(struct whisper_context* ctx, struct whisper_full_params params, const float* samples, int n_samples)
+{
+    return whisper_full_with_state(ctx, ctx->state, params, samples, n_samples);
+}
 
 void whisper_free(struct whisper_context* ctx)
 {
