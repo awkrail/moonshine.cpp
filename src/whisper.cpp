@@ -770,6 +770,33 @@ static void whisper_batch_free(struct whisper_batch& batch)
         free(batch.logits);
 }
 
+static size_t whisper_sched_size(struct whisper_sched &allocr) {
+    size_t size = allocr.meta.size();
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(allocr.sched); ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(allocr.sched, i);
+        size += ggml_backend_sched_get_buffer_size(allocr.sched, backend);
+    }
+    return size;
+}
+
+static bool whisper_sched_graph_init(struct whisper_sched &allocr, std::vector<ggml_backend_t> backends, std::function<struct ggml_cgraph* ()>&& get_graph)
+{
+    auto& sched = allocr.sched;
+    auto& meta = allocr.meta;
+
+    sched = ggml_backend_sched_new(backends.data(), nullptr, backends.size(), WHISPER_MAX_NODES, false, true);
+    meta.resize(ggml_tensor_overhead() * WHISPER_MAX_NODES + ggml_graph_overhead());
+    
+    if (!ggml_backend_sched_alloc_graph(sched, get_graph()))
+    {
+        fprintf(stderr, "%s: failed to allocate the compute buffer\n", __func__);
+        return false;
+    }
+
+    ggml_backend_sched_reset(sched);
+    return true;
+}
+
 struct whisper_context* whisper_init_with_params_no_state(struct whisper_model_loader* loader)
 {
     ggml_time_init();
@@ -829,6 +856,52 @@ struct whisper_context* whisper_init_from_file_with_params_no_state(const char* 
     return ctx;
 }
 
+static bool whisper_kv_cache_init(struct whisper_kv_cache& cache, ggml_backend_t backend,
+                                  ggml_type wtype, int64_t n_text_state, int64_t n_text_layer,
+                                  int n_ctx)
+{
+    const int64_t n_mem = n_text_layer * n_ctx;
+    const int64_t n_elements = n_text_state * n_mem;
+
+    cache.ctx_buf.resize(2 * ggml_tensor_overhead());
+
+    struct ggml_init_params params = {
+        cache.ctx_buf.size(),
+        cache.ctx_buf.data(),
+        true,
+    };
+
+    cache.head = 0;
+    cache.size = n_ctx;
+
+    cache.cells.clear();
+    cache.cells.resize(n_ctx);
+
+    struct ggml_context* ctx = ggml_init(params);
+
+    if (!ctx)
+    {
+        fprintf(stderr,
+            "%s: failed to allocate memory for the kv cache context\n",
+            __func__);
+        return false;
+    }
+
+    cache.k = ggml_new_tensor_1d(ctx, wtype, n_elements);
+    cache.v = ggml_new_tensor_1d(ctx, wtype, n_elements);
+
+    cache.buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!cache.buffer) {
+        fprintf(stderr, "%s: failed to allocate memory for the kv cache\n", __func__);
+        return false;
+    }
+
+    ggml_backend_buffer_clear(cache.buffer, 0);
+    ggml_free(ctx);
+
+    return true;
+}
+
 struct whisper_state* whisper_init_state(whisper_context* ctx)
 {
     whisper_state* state = new whisper_state;
@@ -836,9 +909,95 @@ struct whisper_state* whisper_init_state(whisper_context* ctx)
     if (state->backends.empty())
     {
         fprintf(stderr, "%s: whisper_backend_init() failed\n", __func__);
-        // whisper_free_state(state);
+        whisper_free_state(state);
         return nullptr;
     }
+
+    state->kv_self_n_dec = 1;
+    if (!whisper_kv_cache_init(state->kv_self, state->backends[0], ctx->itype,
+                               ctx->model.hparams.n_text_state,
+                               ctx->model.hparams.n_text_layer,
+                               GGML_PAD(ctx->model.hparams.n_text_ctx, 256)))
+    {
+        fprintf(stderr,
+            "%s: whisper_kv_cache_init() failed for self-attention cache\n",
+            __func__);
+        whisper_free_state(state);
+        return nullptr;
+    }
+
+    {
+        const size_t memory_size = ggml_nbytes(state->kv_self.k) + ggml_nbytes(state->kv_self.v);
+        fprintf(stdout, "%s: kv self size = %7.2f MB\n", __func__, memory_size / 1e6);
+    }
+
+    if (!whisper_kv_cache_init(state->kv_cross, state->backends[0], ctx->itype,
+                               ctx->model.hparams.n_text_state,
+                               ctx->model.hparams.n_text_layer,
+                               GGML_PAD(ctx->model.hparams.n_audio_ctx, 256)))
+    {
+        fprintf(stderr,
+                "%s: whisper_kv_cache_init() faild for cross-attention cache\n",
+                __func__);
+        whisper_free_state(state);
+        return nullptr;
+    }
+
+    {
+        const size_t memory_size = ggml_nbytes(state->kv_cross.k) + ggml_nbytes(state->kv_cross.v);
+        fprintf(stdout, "%s: kv cross size = %7.2f MB\n", __func__, memory_size / 1e6);
+    }
+
+    if (!whisper_kv_cache_init(state->kv_pad, state->backends[0], ctx->itype,
+                               ctx->model.hparams.n_audio_state, 1,
+                               GGML_PAD(ctx->model.hparams.n_audio_ctx, 256)))
+    {
+        fprintf(stderr,
+                "%s: whisper_kv_cache_init() faild for self-attention cache\n",
+                __func__);
+        whisper_free_state(state);
+        return nullptr;
+    }
+
+    {
+        const size_t memory_size = ggml_nbytes(state->kv_pad.k) + ggml_nbytes(state->kv_pad.v);
+        fprintf(stdout, "%s: kv pad  size  = %7.2f MB\n", __func__, memory_size / 1e6);
+    }
+
+    state->logits.reserve(ctx->vocab.n_vocab * ctx->model.hparams.n_text_ctx);
+
+    state->batch = whisper_batch_init(ctx->model.hparams.n_text_ctx, WHISPER_MAX_DECODERS);
+
+    // TAGS: WHISPER_DECODER_INIT
+    state->decoders[0].probs.reserve(ctx->vocab.n_vocab);
+    state->decoders[0].logits.reserve(ctx->vocab.n_vocab);
+    state->decoders[0].logprobs.reserve(ctx->vocab.n_vocab);
+    state->decoders[0].logits_id.reserve(ctx->model.hparams.n_vocab);
+    state->decoders[0].rng = std::mt19937(0);
+
+    // conv
+    {
+        bool ok = whisper_sched_graph_init(state->sched_conv, state->backends, [&]() {
+            return whisper_build_graph_conv(*ctx, *state);
+        });
+
+        if (!ok)
+        {
+            fprintf(stderr, "%s: failed to init conv allocator\n", __func__);
+            whisper_free_state(state);
+            return nullptr;
+        }
+
+        fprintf(stdout, "%s: compute buffer (conv) = %7.2f MB\n", __func__, whisper_sched_size(state->sched_conv) / 1e6);
+    }
+
+    // encoder
+    {
+        // bool ok = whisper_sched_graph_init(state->sched_encode, state->)
+    }
+    // cross-attn
+    // decoder
+
 
     return state;
 }
