@@ -793,6 +793,22 @@ static void whisper_batch_free(struct whisper_batch& batch)
         free(batch.logits);
 }
 
+static void whisper_batch_prep_legacy(whisper_batch& batch, const whisper_token* tokens, int n_tokens, int n_past, int seq_id)
+{
+    batch.n_tokens = n_tokens;
+    for (int i = 0; i < n_tokens; ++i)
+    {
+        if (tokens) {
+            batch.token[i] = tokens[i];
+        }
+        batch.pos[i] = n_past + i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = seq_id;
+        batch.logits[i] = 0;
+    }
+    batch.logits[n_tokens - 1] = 1;
+}
+
 static size_t whisper_sched_size(struct whisper_sched &allocr) {
     size_t size = allocr.meta.size();
     for (int i = 0; i < ggml_backend_sched_get_n_backends(allocr.sched); ++i) {
@@ -1051,6 +1067,206 @@ static struct ggml_cgraph* whisper_build_graph_cross(whisper_context& wctx, whis
     return gf;
 }
 
+static struct ggml_cgraph* whisper_build_graph_decoder(whisper_context& wctx, whisper_state& wstate, const whisper_batch& batch, bool save_alignment_heads_QKs, bool worst_case)
+{
+    const auto &model = wctx.model;
+    const auto &hparams = model.hparams;
+
+    auto &kv_self = wstate.kv_self;
+
+    const int n_ctx = kv_self.size;
+    const int n_state = hparams.n_text_state;
+    const int n_head = hparams.n_text_head;
+    const int n_layer = hparams.n_text_layer;
+
+    const int n_state_head = n_state / n_head;
+
+    const int n_tokens = batch.n_tokens;
+    const int n_audio_ctx = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx
+                                                       : hparams.n_audio_ctx;
+
+    const int n_audio_ctx_pad = GGML_PAD(n_audio_ctx, 256);
+
+    const int32_t n_kv = worst_case ? n_ctx : kv_self.n;
+    const int32_t kv_head = worst_case ? n_ctx - n_tokens : kv_self.head;
+
+    struct ggml_init_params params = {
+        wstate.sched_decode.meta.size(),
+        wstate.sched_decode.meta.data(),
+        true,
+    };
+
+    struct ggml_context* ctx0 = ggml_init(params);
+
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, WHISPER_MAX_NODES, false);
+
+    struct ggml_tensor* embd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(embd, "embd");
+    ggml_set_input(embd);
+
+    struct ggml_tensor* position = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(position, "position");
+    ggml_set_input(position);
+
+    const float KQscale = pow(float(n_state_head), -0.25);
+    
+    struct ggml_tensor *KQ_mask = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, n_tokens, 1);
+    ggml_set_name(KQ_mask, "KQ_mask");
+    ggml_set_input(KQ_mask);
+
+    struct ggml_tensor *KQ_mask_f16 = ggml_cast(ctx0, KQ_mask, GGML_TYPE_F16);
+
+    // token encoding + position encoding
+    struct ggml_tensor *cur = ggml_add(ctx0, ggml_get_rows(ctx0, model.d_te, embd), ggml_get_rows(ctx0, model.d_pe, position));
+
+    struct ggml_tensor *inpL = cur;
+
+    for (int il = 0; il < n_layer; il++)
+    {
+        const auto& layer = model.layers_decoder[il];
+
+        // norm
+        {
+            cur = ggml_norm(ctx0, inpL, hparams.eps);
+            cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.attn_ln_0_w), layer.attn_ln_0_b);
+        }
+
+        // self-attention
+        {
+            struct ggml_tensor* Qcur = ggml_mul_mat(ctx0, layer.attn_q_w, cur);
+            Qcur = ggml_add(ctx0, Qcur, layer.attn_q_b);
+            Qcur = ggml_scale(ctx0, Qcur, KQscale);
+
+            struct ggml_tensor *Kcur = ggml_mul_mat(ctx0, layer.attn_k_w, cur);
+            Kcur = ggml_scale(ctx0, Kcur, KQscale);
+
+            {
+                struct ggml_tensor* Vcur = ggml_mul_mat(ctx0, layer.attn_v_w, cur);
+                Vcur = ggml_add(ctx0, Vcur, layer.attn_v_b);
+
+                struct ggml_tensor* k;
+                struct ggml_tensor* v;
+
+                k = ggml_view_1d(ctx0, kv_self.k, n_tokens * n_state, (ggml_element_size(kv_self.k) * n_state) * (il * n_ctx + kv_head));
+
+                v = ggml_view_1d(ctx0, kv_self.v, n_tokens * n_state, (ggml_element_size(kv_self.v) * n_state) * (il * n_ctx + kv_head));
+
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, k));
+                ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, v));
+            }
+
+            struct ggml_tensor *Q = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Qcur, n_state_head, n_head, n_tokens), 0, 2, 1, 3);
+
+            struct ggml_tensor *K = ggml_view_3d(
+                ctx0, kv_self.k, n_state_head, n_kv, n_head,
+                ggml_element_size(kv_self.k) * n_state,
+                ggml_element_size(kv_self.k) * n_state_head,
+                ggml_element_size(kv_self.k) * n_state * n_ctx * il);
+
+            struct ggml_tensor *V = ggml_view_3d(
+                ctx0, kv_self.v, n_state_head, n_kv, n_head,
+                ggml_element_size(kv_self.v) * n_state,
+                ggml_element_size(kv_self.v) * n_state_head,
+                ggml_element_size(kv_self.v) * n_state * n_ctx * il);
+
+            cur = ggml_flash_attn_ext(ctx0, Q, K, V, KQ_mask_f16, 1.0f, 0.0f, 0.0f);
+
+            cur = ggml_reshape_2d(ctx0, cur, n_state, n_tokens);
+        }
+
+        // projection
+        {
+            cur = ggml_mul_mat(ctx0, layer.attn_ln_1_w, cur);
+            cur = ggml_add(ctx0, cur, layer.attn_ln_1_b);
+        }
+
+        // add the input
+        struct ggml_tensor* inpCA = ggml_add(ctx0, cur, inpL);
+
+        // norm
+        {
+            cur = ggml_norm(ctx0, inpCA, hparams.eps);
+            cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.cross_attn_ln_0_w), layer.cross_attn_ln_0_b);
+        }
+
+        // cross-attn
+        {
+            struct ggml_tensor *Qcur = ggml_mul_mat(ctx0, layer.cross_attn_q_w, cur);
+            Qcur = ggml_add(ctx0, Qcur, layer.cross_attn_q_b);
+
+            struct ggml_tensor *Q = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Qcur, n_state_head, n_head, n_tokens), 0, 2, 1, 3);
+
+            struct ggml_tensor *Kcross = ggml_view_3d(
+                ctx0, wstate.kv_cross.k, n_state_head, n_audio_ctx_pad,
+                n_head, ggml_element_size(wstate.kv_cross.k) * n_state,
+                ggml_element_size(wstate.kv_cross.k) * n_state_head,
+                ggml_element_size(wstate.kv_cross.k) * n_state *
+                    n_audio_ctx_pad * il);
+
+            struct ggml_tensor *Vcross = ggml_view_3d(
+                ctx0, wstate.kv_cross.v, n_state_head, n_audio_ctx_pad,
+                n_head, ggml_element_size(wstate.kv_cross.v) * n_state,
+                ggml_element_size(wstate.kv_cross.v) * n_state_head,
+                ggml_element_size(wstate.kv_cross.v) * n_state *
+                    n_audio_ctx_pad * il);
+
+            cur = ggml_flash_attn_ext(ctx0, Q, Kcross, Vcross, nullptr,
+                                        KQscale, 0.0f, 0.0f);
+
+            cur = ggml_reshape_2d(ctx0, cur, n_state, n_tokens);
+        }
+
+        // projection
+        {
+            cur = ggml_mul_mat(ctx0, layer.cross_attn_ln_1_w, cur);
+            cur = ggml_add(ctx0, cur, layer.cross_attn_ln_1_b);
+        }
+
+        // add the input
+        cur = ggml_add(ctx0, cur, inpCA);
+        
+        struct ggml_tensor* inpFF = cur;
+
+        // feed-forward
+        {
+            // norm
+            {
+                cur = ggml_norm(ctx0, inpFF, hparams.eps);
+                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.mlp_ln_w), layer.mlp_ln_b);
+            }
+
+            // fully-connected
+            cur = ggml_mul_mat(ctx0, layer.mlp_0_w, cur);
+            cur = ggml_add(ctx0, cur, layer.mlp_0_b);
+
+            // GELU
+            cur = ggml_gelu(ctx0, cur);
+
+            // projection
+            cur = ggml_mul_mat(ctx0, layer.mlp_1_w, cur);
+            cur = ggml_add(ctx0, cur, layer.mlp_1_b);
+        }
+
+        inpL = ggml_add(ctx0, cur, inpFF);
+    }
+
+    cur = inpL;
+    
+    // norm
+    {
+        cur = ggml_norm(ctx0, cur, hparams.eps);
+        cur = ggml_add(ctx0, ggml_mul(ctx0, cur, model.d_ln_w), model.d_ln_b);
+    }
+
+    struct ggml_tensor *logits = ggml_mul_mat(ctx0, model.d_te, cur);
+
+    ggml_build_forward_expand(gf, logits);
+
+    ggml_free(ctx0);
+
+    return gf;
+}
+
 struct whisper_context* whisper_init_with_params_no_state(struct whisper_model_loader* loader)
 {
 ggml_time_init();
@@ -1279,6 +1495,26 @@ struct whisper_state* whisper_init_state(whisper_context* ctx)
 
     // decoder
     {
+        bool ok = whisper_sched_graph_init(state->sched_decode, state->backends, [&]() {
+            const auto& hparams = ctx->model.hparams;
+
+            // worst case for memory allocation
+            const int n_tokens = hparams.n_text_ctx;
+            const int n_past = 0;
+
+            whisper_batch_prep_legacy(state->batch, nullptr, n_tokens, n_past, 0);
+            return whisper_build_graph_decoder(*ctx, *state, state->batch, false, true);
+        });
+
+        if (!ok)
+        {
+            fprintf(stderr, "%s: failed to init decoder allocator\n",
+                            __func__);
+            whisper_free_state(state);
+            return nullptr;
+        }
+
+        fprintf(stdout, "%s: compute buffer (decode)  = %7.2f MB\n", __func__, whisper_sched_size(state->sched_decode) / 1e6);
     }
 
     return state;
