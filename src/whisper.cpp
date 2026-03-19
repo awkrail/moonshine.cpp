@@ -12,6 +12,7 @@
 #include <thread>
 #include <functional>
 #include <cstring>
+#include <regex>
 
 static std::string format(const char *fmt, ...) {
     va_list ap;
@@ -175,6 +176,266 @@ select_weight_buft(const whisper_hparams& hparams, ggml_tensor* w, ggml_op op, b
         }
     }
     return nullptr;
+}
+
+static void whisper_compute_logprobs(const std::vector<float> &logits,
+                                     const int n_logits,
+                                     std::vector<float> &logprobs)
+{
+    const float logit_max = *std::max_element(logits.begin(), logits.end());
+    float logsumexp = 0.0f;
+    for (int i = 0; i < n_logits; ++i) {
+        if (logits[i] > -INFINITY) {
+            logsumexp += expf(logits[i] - logit_max);
+        }
+    }
+    logsumexp = logf(logsumexp) + logit_max;
+
+    for (int i = 0; i < n_logits; ++i) {
+        if (logits[i] > -INFINITY) {
+            logprobs[i] = logits[i] - logsumexp;
+        } else {
+            logprobs[i] = -INFINITY;
+        }
+    }
+}
+
+static void whisper_compute_probs(const std::vector<float> &logits,
+                                  const int n_logits,
+                                  const std::vector<float> &logprobs,
+                                  std::vector<float> &probs) 
+{
+    for (int i = 0; i < n_logits; ++i) {
+        if (logits[i] == -INFINITY) {
+            probs[i] = 0.0f;
+        } else {
+            probs[i] = expf(logprobs[i]);
+        }
+    }
+}
+
+static const std::vector<std::string> non_speech_tokens = {
+    "\"", "#",  "(",   ")",   "*",  "+",  "/",   ":",   ";",   "<",  "=",
+    ">",  "@",  "[",   "\\",  "]",  "^",  "_",   "`",   "{",   "|",  "}",
+    "~",  "「", "」",  "『",  "』", "<<", ">>",  "<<<", ">>>", "--", "---",
+    "-(", "-[", "('",  "(\"", "((", "))", "(((", ")))", "[[",  "]]", "{{",
+    "}}", "♪♪", "♪♪♪", "♩",   "♪",  "♫",  "♬",   "♭",   "♮",   "♯"};
+
+static void whisper_process_logits(struct whisper_context &ctx,
+                                   struct whisper_state &state,
+                                   struct whisper_decoder &decoder,
+                                   const struct whisper_full_params params,
+                                   float temperature) {
+    const auto &vocab = ctx.vocab;
+    const auto &tokens_cur = decoder.sequence.tokens;
+
+    const bool is_initial = tokens_cur.size() == 0;
+    const int n_logits = vocab.id_to_token.size();
+
+    // extract the logits for the last token
+    // we will be mutating, and therefore we don't want to use the ctx.logits
+    // buffer directly
+    auto &probs = decoder.probs;
+    auto &logits = decoder.logits;
+    auto &logprobs = decoder.logprobs;
+    {
+        logits.resize(n_logits);
+        memcpy(logits.data(), state.logits.data() + decoder.i_batch * n_logits,
+               n_logits * sizeof(float));
+
+        if (temperature > 0.0f) {
+            for (int i = 0; i < n_logits; i++) {
+                logits[i] /= temperature;
+            }
+        }
+
+        // will be populated a bit later
+        probs.resize(n_logits);
+        logprobs.resize(n_logits);
+    }
+
+    // apply logit filters here
+    // ref:
+    // https://github.com/openai/whisper/blob/0b1ba3d46ebf7fe6f953acfd8cad62a4f851b49f/whisper/decoding.py#L480-L493
+    {
+        // suppress blank
+        // https://github.com/openai/whisper/blob/0b1ba3d46ebf7fe6f953acfd8cad62a4f851b49f/whisper/decoding.py#L388-L390
+        if (params.suppress_blank) {
+            if (is_initial) {
+                logits[vocab.token_eot] = -INFINITY;
+                logits[vocab.token_to_id.at(" ")] = -INFINITY;
+            }
+        }
+
+        // suppress <|notimestamps|> token
+        // ref:
+        // https://github.com/openai/whisper/blob/0b1ba3d46ebf7fe6f953acfd8cad62a4f851b49f/whisper/decoding.py#L410-L412
+        logits[vocab.token_not] = -INFINITY;
+        if (params.no_timestamps) {
+            for (int i = vocab.token_beg; i < n_logits; ++i) {
+                logits[i] = -INFINITY;
+            }
+        }
+
+        // suppress sot and nosp tokens
+        logits[vocab.token_sot] = -INFINITY;
+        logits[vocab.token_nosp] = -INFINITY;
+
+        // [TDRZ] when tinydiarize is disabled, suppress solm token
+        if (params.tdrz_enable == false) {
+            logits[vocab.token_solm] = -INFINITY;
+        }
+
+        // suppress task tokens
+        logits[vocab.token_translate] = -INFINITY;
+        logits[vocab.token_transcribe] = -INFINITY;
+        logits[vocab.token_prev] = -INFINITY;
+
+        // suppress lang tokens
+        for (size_t i = 0; i < g_lang.size(); ++i) {
+            logits[whisper_token_lang(&ctx, i)] = -INFINITY;
+        }
+
+        // suppress prev token
+        logits[vocab.token_prev] = -INFINITY;
+
+        /**
+        if (params.logits_filter_callback) {
+            params.logits_filter_callback(
+                &ctx, &state, tokens_cur.data(), tokens_cur.size(),
+                logits.data(), params.logits_filter_callback_user_data);
+        }
+        **/
+
+        // suppress any tokens matching a regular expression
+        // ref: https://github.com/openai/whisper/discussions/1041
+        if (params.suppress_regex != nullptr) {
+            std::regex re(params.suppress_regex);
+            for (std::pair<whisper_vocab::token, whisper_vocab::id> token_id :
+                 vocab.token_to_id) {
+                if (std::regex_match(token_id.first, re)) {
+                    logits[token_id.second] = -INFINITY;
+                }
+            }
+        }
+
+        // suppress non-speech tokens
+        // ref:
+        // https://github.com/openai/whisper/blob/7858aa9c08d98f75575035ecd6481f462d66ca27/whisper/tokenizer.py#L224-L253
+        if (params.suppress_nst) {
+            for (const std::string &token : non_speech_tokens) {
+                const std::string suppress_tokens[] = {token, " " + token};
+                for (const std::string &suppress_token : suppress_tokens) {
+                    if (vocab.token_to_id.find(suppress_token) !=
+                        vocab.token_to_id.end()) {
+                        logits[vocab.token_to_id.at(suppress_token)] =
+                            -INFINITY;
+                    }
+                }
+            }
+
+            // allow hyphens "-" and single quotes "'" between words, but not at
+            // the beginning of a word
+            if (vocab.token_to_id.find(" -") != vocab.token_to_id.end()) {
+                logits[vocab.token_to_id.at(" -")] = -INFINITY;
+            }
+            if (vocab.token_to_id.find(" '") != vocab.token_to_id.end()) {
+                logits[vocab.token_to_id.at(" '")] = -INFINITY;
+            }
+        }
+
+        // timestamps have to appear in pairs, except directly before EOT; mask
+        // logits accordingly
+        // https://github.com/openai/whisper/blob/0b1ba3d46ebf7fe6f953acfd8cad62a4f851b49f/whisper/decoding.py#L414-L424
+        {
+            const bool last_was_timestamp =
+                tokens_cur.size() > 0 &&
+                tokens_cur.back().id >= vocab.token_beg;
+            const bool penultimate_was_timestamp =
+                tokens_cur.size() < 2 ||
+                tokens_cur[tokens_cur.size() - 2].id >= vocab.token_beg;
+
+            // WHISPER_LOG_INFO("last_was_timestamp=%d
+            // penultimate_was_timestamp=%d\n", last_was_timestamp,
+            // penultimate_was_timestamp);
+
+            if (last_was_timestamp) {
+                if (penultimate_was_timestamp) {
+                    for (int i = vocab.token_beg; i < n_logits; ++i) {
+                        logits[i] = -INFINITY;
+                    }
+                } else {
+                    for (int i = 0; i < vocab.token_eot; ++i) {
+                        logits[i] = -INFINITY;
+                    }
+                }
+            }
+        }
+
+        // the initial timestamp cannot be larger than max_initial_ts
+        // ref:
+        // https://github.com/openai/whisper/blob/0b1ba3d46ebf7fe6f953acfd8cad62a4f851b49f/whisper/decoding.py#L426-L429
+        if (is_initial && params.max_initial_ts > 0.0f) {
+            const float precision =
+                float(WHISPER_CHUNK_SIZE) / ctx.model.hparams.n_audio_ctx;
+            const int tid0 = std::round(params.max_initial_ts / precision);
+
+            for (int i = vocab.token_beg + tid0 + 1; i < n_logits; ++i) {
+                logits[i] = -INFINITY;
+            }
+        }
+
+        // condition timestamp tokens to be increasing
+        // ref:
+        // https://github.com/openai/whisper/pull/831#issuecomment-1385910556
+        if (decoder.has_ts) {
+            const int tid0 = decoder.seek_delta / 2;
+
+            for (int i = vocab.token_beg; i < vocab.token_beg + tid0; ++i) {
+                logits[i] = -INFINITY;
+            }
+        }
+
+        // populate the logprobs array (log_softmax)
+        whisper_compute_logprobs(logits, n_logits, logprobs);
+
+        // if sum of probability over timestamps is above any other token,
+        // sample timestamp ref:
+        // https://github.com/openai/whisper/blob/0b1ba3d46ebf7fe6f953acfd8cad62a4f851b49f/whisper/decoding.py#L431-L437
+        {
+            // logsumexp over timestamps
+            float timestamp_logprob = -INFINITY;
+            {
+                float logsumexp = 0.0f;
+                const float logprob_max = *std::max_element(
+                    logprobs.begin() + vocab.token_beg, logprobs.end());
+                for (int i = vocab.token_beg; i < n_logits; ++i) {
+                    if (logprobs[i] > -INFINITY) {
+                        logsumexp += expf(logprobs[i] - logprob_max);
+                    }
+                }
+                if (logsumexp > 0.0f) {
+                    timestamp_logprob = logf(logsumexp) + logprob_max;
+                }
+            }
+
+            const float max_text_token_logprob = *std::max_element(
+                logprobs.begin(), logprobs.begin() + vocab.token_beg);
+
+            // WHISPER_LOG_INFO("timestamp_logprob=%f
+            // max_text_token_logprob=%f\n", timestamp_logprob,
+            // max_text_token_logprob);
+            if (timestamp_logprob > max_text_token_logprob) {
+                for (int i = 0; i < vocab.token_beg; ++i) {
+                    logits[i] = -INFINITY;
+                    logprobs[i] = -INFINITY;
+                }
+            }
+        }
+    }
+
+    // compute probs
+    whisper_compute_probs(logits, n_logits, logprobs, probs);
 }
 
 static bool whisper_model_load(struct whisper_model_loader* loader, whisper_context& wctx)
@@ -784,6 +1045,25 @@ static void whisper_kv_cache_clear(struct whisper_kv_cache &cache)
     cache.head = 0;
 
     ggml_backend_buffer_clear(cache.buffer, 0);
+}
+
+static void whisper_kv_cache_seq_cp(struct whisper_kv_cache &cache,
+                                    whisper_seq_id seq_id_src,
+                                    whisper_seq_id seq_id_dst, whisper_pos p0,
+                                    whisper_pos p1) {
+    if (p0 < 0)
+        p0 = 0;
+    if (p1 < 0)
+        p1 = std::numeric_limits<whisper_pos>::max();
+
+    cache.head = 0;
+
+    for (uint32_t i = 0; i < cache.size; ++i) {
+        if (cache.cells[i].has_seq_id(seq_id_src) && cache.cells[i].pos >= p0 &&
+            cache.cells[i].pos < p1) {
+            cache.cells[i].seq_id.insert(seq_id_dst);
+        }
+    }
 }
 
 static void whisper_kv_cache_free(struct whisper_kv_cache& cache)
@@ -1913,13 +2193,21 @@ int whisper_n_text_ctx(struct whisper_context* ctx)
     return ctx->model.hparams.n_text_ctx;
 }
 
-int whisper_n_audio_ctx(struct whisper_context *ctx)
+int whisper_n_audio_ctx(struct whisper_context* ctx)
 {
     return ctx->model.hparams.n_audio_ctx;
 }
 
 whisper_token whisper_token_sot(struct whisper_context *ctx) {
     return ctx->vocab.token_sot;
+}
+
+whisper_token whisper_token_lang(struct whisper_context *ctx, int lang_id) {
+    return whisper_token_sot(ctx) + 1 + lang_id;
+}
+
+whisper_token whisper_token_nosp(struct whisper_context *ctx) {
+    return ctx->vocab.token_nosp;
 }
 
 struct whisper_state* whisper_init_state(whisper_context* ctx)
@@ -2285,7 +2573,6 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
             state->no_speech_prob = probs[whisper_token_nosp(ctx)];
         }
 
-        /**
         {
             const int64_t t_start_sample_us = ggml_time_us();
             state->decoders[0].i_batch = prompt.size() - 1;
@@ -2296,7 +2583,12 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
             memcpy(decoder.logprobs.data(), state->decoders[0].logprobs.data(), decoder.logprobs.size() * sizeof(decoder.logprobs[0]));
             state->t_sample_us += ggml_time_us() - t_start_sample_us;
         }
-        **/
+    }
+
+    for (int i = 0, n_max = whisper_n_text_ctx(ctx) / 2 -4; i < n_max; i++)
+    {
+
+
     }
 
     return 0;

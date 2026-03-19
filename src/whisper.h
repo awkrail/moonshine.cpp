@@ -934,6 +934,7 @@ struct whisper_state
     std::vector<whisper_segment> result_all;
 
     int32_t exp_n_audio_ctx = 0; // 0 - use default
+    float no_speech_prob = 0.0f;
 };
 
 struct whisper_context
@@ -1061,6 +1062,15 @@ struct whisper_full_params whisper_full_default_params();
 struct whisper_context* whisper_init_from_file_with_params(const char* path_model);
 
 int whisper_full(struct whisper_context* ctx, struct whisper_full_params params, const float* samples, int n_samples);
+
+int whisper_n_len_from_state(struct whisper_state* state);
+int whisper_n_text_ctx(struct whisper_context* ctx);
+int whisper_n_audio_ctx(struct whisper_context* ctx);
+
+// return whisper_token
+whisper_token whisper_token_sot(struct whisper_context *ctx);
+whisper_token whisper_token_lang(struct whisper_context *ctx, int lang_id);
+whisper_token whisper_token_nosp(struct whisper_context *ctx);
 
 // Frees all allocated memory
 void whisper_free(struct whisper_context* ctx);
