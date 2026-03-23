@@ -476,7 +476,7 @@ static whisper_token_data whisper_sample_token(whisper_context& ctx, const whisp
     {
         for (int i = 0; i < n_logits; i++)
         {
-            if (result.p > probs[i])
+            if (result.p < probs[i])
             {
                 result.id = i;
                 result.p = probs[i];
@@ -2710,13 +2710,16 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
             {
                 if (result_len == 0 && !params.no_timestamps)
                 {
-                    result_len = i + 1;
-                }
-                else
-                {
-                    fprintf(stderr, "%s: decoder failed\n", __func__);
-                    failed = true;
-                    continue;
+                    if (seek + seek_delta + delta_min >= seek_end)
+                    {
+                        result_len = i + 1;
+                    }
+                    else
+                    {
+                        fprintf(stderr, "%s: decoder failed\n", __func__);
+                        failed = true;
+                        continue;
+                    }
                 }
 
                 if (params.single_segment || params.no_timestamps)
@@ -2843,4 +2846,36 @@ void whisper_free(struct whisper_context* ctx)
         whisper_free_state(ctx->state);
         delete ctx;
     }
+}
+
+void whisper_print_timings(struct whisper_context *ctx)
+{
+    const int64_t t_end_us = ggml_time_us();
+
+    printf("\n");
+    printf("%s:     load time = %8.2f ms\n", __func__, ctx->t_load_us / 1000.0f);
+
+    if (ctx->state != nullptr) {
+        const int32_t n_sample = std::max(1, ctx->state->n_sample);
+        const int32_t n_encode = std::max(1, ctx->state->n_encode);
+        const int32_t n_decode = std::max(1, ctx->state->n_decode);
+        const int32_t n_batchd = std::max(1, ctx->state->n_batchd);
+        const int32_t n_prompt = std::max(1, ctx->state->n_prompt);
+
+        printf("%s:     fallbacks = %3d p / %3d h\n", __func__,
+                         ctx->state->n_fail_p, ctx->state->n_fail_h);
+        printf("%s:      mel time = %8.2f ms\n", __func__,
+                         ctx->state->t_mel_us / 1000.0f);
+        printf("%s:   sample time = %8.2f ms / %5d runs ( %8.2f ms per run)\n",
+               __func__, 1e-3f * ctx->state->t_sample_us, n_sample, 1e-3f * ctx->state->t_sample_us / n_sample);
+        printf("%s:   encode time = %8.2f ms / %5d runs ( %8.2f ms per run)\n",
+                __func__, 1e-3f * ctx->state->t_encode_us, n_encode, 1e-3f * ctx->state->t_encode_us / n_encode);
+        printf("%s:   decode time = %8.2f ms / %5d runs ( %8.2f ms per run)\n",
+                __func__, 1e-3f * ctx->state->t_decode_us, n_decode, 1e-3f * ctx->state->t_decode_us / n_decode);
+        printf("%s:   batchd time = %8.2f ms / %5d runs ( %8.2f ms per run)\n",
+                __func__, 1e-3f * ctx->state->t_batchd_us, n_batchd, 1e-3f * ctx->state->t_batchd_us / n_batchd);
+        printf("%s:   prompt time = %8.2f ms / %5d runs ( %8.2f ms per run)\n",
+                __func__, 1e-3f * ctx->state->t_prompt_us, n_prompt, 1e-3f * ctx->state->t_prompt_us / n_prompt);
+    }
+    printf("%s:    total time = %8.2f ms\n", __func__, (t_end_us - ctx->t_start_us) / 1000.0f);
 }

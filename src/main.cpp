@@ -72,7 +72,7 @@ int main(int argc, char* argv[])
 
     print_segments(ctx, false);
 
-    //whisper_print_timings(ctx);
+    whisper_print_timings(ctx);
     whisper_free(ctx);
 
     return 0;

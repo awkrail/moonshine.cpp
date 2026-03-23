@@ -1082,4 +1082,6 @@ void whisper_free_state(struct whisper_state*  state);
 // void whisper_free_params(struct whisper_full_params * params);
 // void whisper_free_context_params(struct whisper_context_params * params);
 
+void whisper_print_timings(struct whisper_context *ctx);
+
 #endif
