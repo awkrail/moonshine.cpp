@@ -552,6 +552,7 @@ static bool whisper_model_load(struct whisper_model_loader* loader, whisper_cont
             {
                 tmp.resize(len);
                 loader->read(loader->context, &tmp[0], tmp.size());
+                word.assign(&tmp[0], tmp.size());
             }
             else
             {
@@ -2585,11 +2586,11 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
         }
     }
 
+    /**
     for (int i = 0, n_max = whisper_n_text_ctx(ctx) / 2 -4; i < n_max; i++)
     {
-
-
     }
+    **/
 
     return 0;
 }
