@@ -34,14 +34,15 @@ static void print_segments(struct whisper_context * ctx, bool no_timestamps) {
 
 int main(int argc, char* argv[])
 {
-    if (argc != 2)
+    if (argc != 3)
     {
-        fprintf(stderr, "failed to parse args. Usage: ./build/whisper_lite jfk.wav\n");
+        fprintf(stderr, "failed to parse args. Usage: ./build/whisper_lite model_path jfk.wav\n");
         return 1;
     }
 
     whisper_params params;
-    params.fname_inp = std::string(argv[1]);
+    params.model = std::string(argv[1]);
+    params.fname_inp = std::string(argv[2]);
 
     // init context
     whisper_context* ctx = whisper_init_from_file_with_params(params.model.c_str());
